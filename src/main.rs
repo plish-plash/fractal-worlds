@@ -44,13 +44,134 @@ const EXPORT_SIZES: [(&str, ExportSize); 13] = [
 /// Smallest zoom scale and speed the f64 bookkeeping supports.
 const MIN_SCALE: f64 = 1.0e-290;
 
+const USAGE: &str = r#"Usage:
+  fractal-worlds                      Open the app.
+  fractal-worlds list                 List the built-in worlds and saved scenes.
+  fractal-worlds render SCENE [-o OUT.png] [--size WxH] [--samples N]
+
+render draws one image and quits. SCENE is a .fw file path, a built-in world
+name ("Mandelbox" or "mandelbox"), or the name of a scene saved in ./scenes.
+
+  -o, --out OUT.png   Output file (default renders/<scene-name>.png).
+  --size WxH          Image size in pixels (default 1600x900).
+  --samples N         Samples per pixel (default 32)."#;
+
+/// What the program was asked to do.
+enum Cmd {
+    App,
+    List,
+    Render(RenderJob),
+}
+
+fn parse_size(v: &str) -> Result<(i32, i32), String> {
+    let bad = || format!("Bad size '{}': use WIDTHxHEIGHT, such as 1920x1080", v);
+    let (w, h) = v.split_once(['x', 'X']).ok_or_else(bad)?;
+    let w: i32 = w.trim().parse().map_err(|_| bad())?;
+    let h: i32 = h.trim().parse().map_err(|_| bad())?;
+    Ok((w.clamp(16, 16384), h.clamp(16, 16384)))
+}
+
+/// Find a scene by file path, built-in world name, or saved scene name.
+fn resolve_scene(arg: &str) -> Result<Scene, String> {
+    let read = |p: &std::path::Path| -> Result<Scene, String> {
+        std::fs::read_to_string(p).map_err(|e| e.to_string()).and_then(|t| Scene::from_text(&t)).map_err(|e| format!("Could not load {}: {}", p.display(), e))
+    };
+    let path = PathBuf::from(arg);
+    if path.is_file() {
+        return read(&path);
+    }
+    if arg.ends_with(".fw") {
+        return Err(format!("No such file: {}", arg));
+    }
+    if let Some(sc) = scene::presets().into_iter().find(|p| p.name.eq_ignore_ascii_case(arg) || slug(&p.name) == slug(arg)) {
+        return Ok(sc);
+    }
+    let saved = PathBuf::from(SCENE_DIR).join(format!("{}.fw", arg));
+    if saved.is_file() {
+        return read(&saved);
+    }
+    Err(format!("No built-in world, saved scene or file called '{}'. Run 'fractal-worlds list' to see the names.", arg))
+}
+
+fn parse_args() -> Result<Cmd, String> {
+    let mut args = std::env::args().skip(1);
+    let Some(first) = args.next() else { return Ok(Cmd::App) };
+    match first.as_str() {
+        "-h" | "--help" | "help" => Err(USAGE.to_string()),
+        "list" => match args.next() {
+            None => Ok(Cmd::List),
+            Some(a) => Err(format!("Unexpected argument '{}'\n\n{}", a, USAGE)),
+        },
+        "render" => {
+            let (mut scene, mut out, mut size, mut samples) = (None, None, (1600, 900), 32);
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "-o" | "--out" => out = Some(PathBuf::from(args.next().ok_or("-o needs a file name")?)),
+                    "--size" => size = parse_size(&args.next().ok_or("--size needs a value such as 1600x900")?)?,
+                    "--samples" => {
+                        let v = args.next().ok_or("--samples needs a number")?;
+                        samples = v.parse::<i32>().map_err(|_| format!("Bad sample count '{}'", v))?.clamp(1, 1024);
+                    }
+                    s if s.starts_with('-') => return Err(format!("Unknown option '{}'\n\n{}", s, USAGE)),
+                    s if scene.is_none() => scene = Some(resolve_scene(s)?),
+                    s => return Err(format!("Unexpected argument '{}': render takes one scene", s)),
+                }
+            }
+            let scene = scene.ok_or_else(|| format!("render needs a scene\n\n{}", USAGE))?;
+            let out = out.unwrap_or_else(|| PathBuf::from(RENDER_DIR).join(format!("{}.png", slug(&scene.name))));
+            Ok(Cmd::Render(RenderJob { scene: Some(scene), out, size, samples, frames: 0, exporting: false }))
+        }
+        other => Err(format!("Unknown command '{}'\n\n{}", other, USAGE)),
+    }
+}
+
 fn main() -> eframe::Result {
+    let job = match parse_args() {
+        Ok(Cmd::App) => None,
+        Ok(Cmd::List) => {
+            println!("Built-in worlds:");
+            for p in scene::presets() {
+                println!("  {:<22} {}", slug(&p.name), p.name);
+            }
+            let saved = list_scene_files();
+            if !saved.is_empty() {
+                println!("\nSaved scenes in ./{}:", SCENE_DIR);
+                for s in saved {
+                    println!("  {}", s);
+                }
+            }
+            return Ok(());
+        }
+        Ok(Cmd::Render(j)) => Some(j),
+        Err(msg) => {
+            eprintln!("{}", msg);
+            std::process::exit(2);
+        }
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("Fractal Worlds").with_inner_size([1480.0, 900.0]),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
-    eframe::run_native("Fractal Worlds", options, Box::new(|_cc| Ok(Box::new(App::new()))))
+    eframe::run_native("Fractal Worlds", options, Box::new(move |_cc| Ok(Box::new(App::new(job)))))
+}
+
+/// A single image rendered from the command line, after which the app closes.
+struct RenderJob {
+    /// Taken when the scene is loaded on the first frame.
+    scene: Option<Scene>,
+    out: PathBuf,
+    size: (i32, i32),
+    samples: i32,
+    /// Frames since the scene was loaded; the zoom scale needs a few to settle.
+    frames: u32,
+    exporting: bool,
+}
+
+/// File name for a world: lower case, words joined by hyphens.
+fn slug(name: &str) -> String {
+    let s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
+    s.split('-').filter(|w| !w.is_empty()).collect::<Vec<_>>().join("-")
 }
 
 enum OpAct {
@@ -131,6 +252,7 @@ struct App {
     export_scale: i32,
     export_samples: i32,
     want_export: bool,
+    job: Option<RenderJob>,
 }
 
 // ------------------------------------------------------------- ui helpers
@@ -182,7 +304,7 @@ fn ease(t: f64) -> f64 {
 }
 
 impl App {
-    fn new() -> App {
+    fn new(job: Option<RenderJob>) -> App {
         let presets = scene::presets();
         let scene = presets[0].clone();
         App {
@@ -216,14 +338,41 @@ impl App {
             zoom_time: 2.5,
             level: true,
             solid: true,
-            show_panel: true,
+            show_panel: job.is_none(),
             save_name: "my-world".to_string(),
             files: list_scene_files(),
             status: String::new(),
             export_scale: 2,
             export_samples: 16,
             want_export: false,
+            job,
         }
+    }
+
+    /// Advance a command-line render by one frame. `exported` is the message of
+    /// an export that finished on the frame just drawn.
+    fn step_job(&mut self, ctx: &egui::Context, exported: Option<String>) {
+        let Some(j) = &mut self.job else { return };
+        if j.exporting {
+            if let Some(m) = exported {
+                if m.starts_with("Export failed") {
+                    eprintln!("{}", m);
+                    std::process::exit(1);
+                }
+                println!("{}", m);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+        } else if let Some(sc) = j.scene.take() {
+            self.load_scene(sc);
+        } else if j.frames >= 20 {
+            j.exporting = true;
+            self.want_export = true;
+        }
+        if let Some(j) = &mut self.job {
+            j.frames += 1;
+        }
+        ctx.request_repaint();
     }
 
     fn reset_view_state(&mut self) {
@@ -802,12 +951,17 @@ impl App {
                 ExportSize::Fixed(w, h) => (w, h),
             };
             let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            Some(render::Export {
+            let mut ex = render::Export {
                 width: ew.clamp(16, 16384),
                 height: eh.clamp(16, 16384),
                 samples: self.export_samples,
                 path: PathBuf::from(RENDER_DIR).join(format!("fractal-{}.png", stamp)),
-            })
+            };
+            if let Some(j) = &self.job {
+                (ex.width, ex.height, ex.samples) = (j.size.0, j.size.1, j.samples);
+                ex.path = j.out.clone();
+            }
+            Some(ex)
         } else {
             None
         };
@@ -873,6 +1027,7 @@ impl eframe::App for App {
         self.time += dt;
 
         // Results from the frame that was just drawn.
+        let mut exported = None;
         if let Ok(mut r) = self.renderer.lock() {
             if let Some(p) = r.probe.take() {
                 // The zoom scale follows the distance to the nearest surface, snapped to a
@@ -885,9 +1040,11 @@ impl eframe::App for App {
             self.samples = r.samples;
             self.shader_error = r.error.clone();
             if let Some(m) = r.message.take() {
-                self.status = m;
+                self.status = m.clone();
+                exported = Some(m);
             }
         }
+        self.step_job(ctx, exported);
 
         if self.show_panel {
             egui::SidePanel::left("controls").resizable(true).default_width(390.0).show(ctx, |ui| self.panel(ui));

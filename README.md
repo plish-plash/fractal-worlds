@@ -3,6 +3,32 @@
 A desktop app for flying through, zooming without limit into, and morphing 3D
 fractals. Rust, egui for the interface, OpenGL (via glow) for the raymarcher.
 
+<table>
+  <tr>
+    <td><img src="docs/images/apollonian-caves.png" alt="Apollonian caves"></td>
+    <td><img src="docs/images/sponge-lattice.png" alt="Sponge lattice"></td>
+    <td><img src="docs/images/octahedral-lattice.png" alt="Octahedral lattice"></td>
+  </tr>
+  <tr>
+    <td align="center">Apollonian caves</td>
+    <td align="center">Sponge lattice</td>
+    <td align="center">Octahedral lattice</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/twisted-caverns.png" alt="Twisted caverns"></td>
+    <td><img src="docs/images/mandelbulb.png" alt="Mandelbulb"></td>
+    <td><img src="docs/images/mandelbox.png" alt="Mandelbox"></td>
+  </tr>
+  <tr>
+    <td align="center">Twisted caverns</td>
+    <td align="center">Mandelbulb</td>
+    <td align="center">Mandelbox</td>
+  </tr>
+</table>
+
+All images are built-in worlds at their starting view, made with the
+`render` command (see [Command line](#command-line)).
+
 ## Build and run
 
     cargo run --release
@@ -129,6 +155,33 @@ image returns to full resolution and averages jittered samples until clean.
 Scenes saved by the first version still load, except ones that used a Plane
 fold (its values changed from a vector to two angles); their wander amounts
 and keyframes are ignored.
+
+## Command line
+
+    cargo run --release -- list
+    cargo run --release -- render SCENE [-o OUT.png] [--size WxH] [--samples N]
+
+`list` prints the built-in worlds and the scenes saved in `scenes/`.
+
+`render` draws one image of a scene and quits. SCENE is any of:
+
+- a built-in world, by name or by its listed short name: `"Open sea"` or
+  `open-sea`;
+- the name of a scene saved in `scenes/`: `my-world`;
+- a path to a `.fw` file: `path/to/view.fw`.
+
+The image goes to `renders/<scene-name>.png` unless `-o` says otherwise.
+`--size` defaults to 1600x900 and `--samples` to 32. A saved scene renders
+from its saved camera, so save a view from the app and render it at any size.
+The app window opens while the image renders; leave it alone until it closes.
+
+For example, to redraw a README image:
+
+    cargo run --release -- render mandelbox -o docs/images/mandelbox.png
+
+Run the commands through `cargo run`, or wait for the exe yourself: release
+builds are Windows GUI programs, so a shell that starts
+`fractal-worlds.exe` directly does not wait for it to finish.
 
 ## Source layout
 
