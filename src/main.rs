@@ -202,6 +202,23 @@ struct Glide {
     done: f64,
 }
 
+/// A continuous zoom: the distance to the surface along `look` shrinks (or,
+/// zooming out, grows) by a constant factor per second until stopped. Flight
+/// speed stays in proportion to that distance.
+struct Stream {
+    /// Direction the distance is measured along. Zooming in moves along it, zooming out against it.
+    look: V3,
+    out: bool,
+    /// Seconds since the zoom started; used to ease the rate in.
+    t: f64,
+    /// Current distance to the surface along `look`, corrected by every fresh probe.
+    dist: f64,
+    /// Flight speed per unit of distance, fixed when the zoom starts.
+    ratio: f64,
+    /// The probe found no surface along `look`.
+    lost: bool,
+}
+
 /// A zoom waiting for the distance along its direction to be measured.
 struct ZoomRequest {
     dir: V3,
@@ -239,6 +256,7 @@ struct App {
     shader_error: Option<String>,
 
     glide: Option<Glide>,
+    stream: Option<Stream>,
     zoom_req: Option<ZoomRequest>,
     zoom_frac: f32,
     zoom_time: f32,
@@ -333,6 +351,7 @@ impl App {
             samples: 0,
             shader_error: None,
             glide: None,
+            stream: None,
             zoom_req: None,
             zoom_frac: 0.1,
             zoom_time: 2.5,
@@ -379,6 +398,7 @@ impl App {
         self.scale = 1.0;
         self.probe = None;
         self.glide = None;
+        self.stream = None;
         self.zoom_req = None;
     }
 
@@ -450,15 +470,30 @@ impl App {
         });
         self.scene.speed = self.scene.speed.clamp(MIN_SCALE, 1.0e6);
         ui.horizontal(|ui| {
-            if ui.button("Zoom to surface (Z)").clicked() {
-                self.zoom_req = Some(ZoomRequest { dir: self.scene.cam.rot.fwd(), out: false });
-            }
-            if ui.button("Zoom back out (X)").clicked() {
-                self.zoom_req = Some(ZoomRequest { dir: self.scene.cam.rot.fwd(), out: true });
+            if self.stream.is_some() {
+                if ui.button("Stop zooming").clicked() {
+                    self.stream = None;
+                }
+            } else {
+                if ui.button("Zoom to surface (Z)").clicked() {
+                    self.zoom_req = Some(ZoomRequest { dir: self.scene.cam.rot.fwd(), out: false });
+                }
+                if ui.button("Zoom back out (X)").clicked() {
+                    self.zoom_req = Some(ZoomRequest { dir: self.scene.cam.rot.fwd(), out: true });
+                }
             }
         });
-        sl_log(ui, &mut self.zoom_frac, 0.01, 0.5, "Zoom stops at this fraction of the distance");
-        sl_log(ui, &mut self.zoom_time, 0.3, 10.0, "Zoom time (s)");
+        ui.add(
+            egui::Slider::new(&mut self.zoom_frac, 0.0..=0.5)
+                .logarithmic(true)
+                .smallest_positive(0.01)
+                .text("Zoom stops at this fraction of the distance"),
+        );
+        let continuous = self.zoom_frac <= 0.0;
+        sl_log(ui, &mut self.zoom_time, 0.3, 10.0, if continuous { "Seconds per 10x zoom" } else { "Zoom time (s)" });
+        if continuous {
+            ui.small("At 0 a zoom never stops: Z or right-click zooms in and X zooms out, without end, until you press Z, X or a movement key.");
+        }
         ui.checkbox(&mut self.level, "Keep the horizon level");
         ui.checkbox(&mut self.solid, "Solid surfaces: stop before passing through");
         sl(ui, &mut self.scene.q.fov, 20.0, 130.0, "Field of view (deg)");
@@ -786,8 +821,20 @@ impl App {
         if p.dir != want {
             return; // the measurement for this direction arrives next frame
         }
-        let frac = self.zoom_frac.clamp(0.001, 0.9) as f64;
         let speed0 = self.scene.speed;
+        if self.zoom_frac <= 0.0 {
+            // Continuous: measure along the request either way; zooming out backs away from it.
+            let near = if p.hit > 0.0 { p.hit } else if req.out { p.de.max(0.0) } else { 0.0 };
+            if near > 0.0 {
+                self.glide = None;
+                self.stream = Some(Stream { look: req.dir, out: req.out, t: 0.0, dist: near, ratio: speed0 / near, lost: false });
+            } else {
+                self.status = "There is no surface in that direction to zoom to.".to_string();
+            }
+            self.zoom_req = None;
+            return;
+        }
+        let frac = self.zoom_frac.clamp(0.001, 0.9) as f64;
         if req.out {
             // Back straight away from whatever is ahead (or simply from the nearest surface).
             let near = if p.hit > 0.0 { p.hit } else { p.de.max(0.0) };
@@ -825,8 +872,11 @@ impl App {
         }
 
         // Zoom requests: Z / X along the view, right-click toward the cursor.
+        // During a continuous zoom, Z or X stops it instead.
         if inp.zoom_in || inp.zoom_out {
-            self.zoom_req = Some(ZoomRequest { dir: f, out: inp.zoom_out });
+            if self.stream.take().is_none() {
+                self.zoom_req = Some(ZoomRequest { dir: f, out: inp.zoom_out });
+            }
         }
         if resp.secondary_clicked() {
             if let Some(p) = inp.hover {
@@ -839,6 +889,7 @@ impl App {
         let steering = inp.mv.iter().any(|v| *v != 0.0);
         if steering {
             self.glide = None;
+            self.stream = None;
             self.zoom_req = None;
         }
         self.start_zoom();
@@ -857,6 +908,34 @@ impl App {
             self.probe_dir = g.dir;
             if g.t >= 1.0 {
                 self.glide = None;
+            }
+        }
+        if let Some(s) = self.stream.as_mut() {
+            gliding = true;
+            self.probe_dir = s.look;
+            if s.lost {
+                self.status = "Continuous zoom stopped: no surface left in that direction.".to_string();
+                self.stream = None;
+            } else {
+                s.t += dt;
+                // Ease the rate in over the first half second.
+                let e = (s.t / 0.5).min(1.0);
+                let k = std::f64::consts::LN_10 / zoom_time * e * e * (3.0 - 2.0 * e);
+                let (step, dist) = if s.out {
+                    let d = s.dist * (k * dt).exp();
+                    (s.dist - d, d)
+                } else {
+                    let d = s.dist * (-k * dt).exp();
+                    (s.dist - d, d)
+                };
+                self.scene.cam.pos.add_f64((s.look * step).arr());
+                s.dist = dist;
+                let speed = s.ratio * dist;
+                self.scene.speed = speed.clamp(MIN_SCALE, 1.0e6);
+                if speed <= MIN_SCALE * 10.0 || speed >= 1.0e6 {
+                    self.status = "Continuous zoom stopped at the limit of the app's range.".to_string();
+                    self.stream = None;
+                }
             }
         }
         if gliding {
@@ -991,6 +1070,9 @@ impl App {
 
         // Status bar.
         let mut hud = format!("{}   speed {:.2e} /s", self.scene.name, self.scene.speed);
+        if let Some(s) = &self.stream {
+            hud.push_str(if s.out { "   zooming out (Z, X or move to stop)" } else { "   zooming in (Z, X or move to stop)" });
+        }
         if let Some(p) = self.probe {
             if p.hit > 0.0 {
                 hud.push_str(&format!("   surface ahead {:.2e}", p.hit));
@@ -1013,7 +1095,7 @@ impl App {
             ui.painter().text(rect.left_top() + egui::vec2(10.0, 10.0), egui::Align2::LEFT_TOP, msg, font, WARN);
         }
 
-        if active || morphing || self.glide.is_some() || self.zoom_req.is_some() || self.samples < self.scene.q.samples {
+        if active || morphing || self.glide.is_some() || self.stream.is_some() || self.zoom_req.is_some() || self.samples < self.scene.q.samples {
             ctx.request_repaint();
         }
     }
@@ -1034,6 +1116,17 @@ impl eframe::App for App {
                 // power of two so that it holds still while the camera does.
                 if p.de > 0.0 && p.de.is_finite() {
                     self.scale = 2f64.powf(p.de.log2().round()).clamp(MIN_SCALE, 1.0e6);
+                }
+                // A continuous zoom re-measures its distance every frame, so it
+                // follows the real surface instead of drifting through or away from it.
+                if let Some(s) = self.stream.as_mut() {
+                    if p.dir == s.look.f32() {
+                        if p.hit > 0.0 && p.hit.is_finite() {
+                            s.dist = p.hit;
+                        } else if !s.out {
+                            s.lost = true;
+                        }
+                    }
                 }
                 self.probe = Some(p);
             }

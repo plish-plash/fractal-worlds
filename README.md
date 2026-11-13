@@ -59,6 +59,14 @@ decelerates smoothly to a stop at a set fraction of the original distance
 zoom you fly through the smaller world at the same apparent pace. Zoom again
 to go deeper; X reverses it. Any movement key cancels a glide.
 
+Set the zoom stop fraction to 0 (the far left of its slider) for a
+continuous zoom. Z or right-click then zooms in toward that point without
+end, and X zooms out, at a steady rate set by "Seconds per 10x zoom". The
+distance is re-measured every frame, so the zoom follows the real surface.
+Press Z, X or any movement key to stop. A continuous zoom also stops by
+itself if the surface disappears from that direction, or at the app's depth
+limit.
+
 With "Solid surfaces" on, flight stops just short of a wall in the direction
 you are travelling.
 
