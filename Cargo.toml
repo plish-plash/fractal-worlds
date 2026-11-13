@@ -1,0 +1,17 @@
+[package]
+name = "fractal-worlds"
+version = "0.1.0"
+edition = "2021"
+description = "Fly through, deep-zoom and morph distance-estimated 3D fractals."
+
+[dependencies]
+# Pinned to the 0.29 line: render.rs uses the glow 0.14 API that eframe 0.29 re-exports.
+eframe = "0.29.1"
+png = "0.17"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
